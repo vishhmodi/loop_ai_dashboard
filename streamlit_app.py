@@ -615,7 +615,7 @@ with tab_dispatch:
                         else:
                             st.warning("No nearby driver found within the max distance.")
 
-        # ---------- Map View (sanitized to avoid vars()/to_numeric errors) ----------
+              # ---------- Map View (sanitized to avoid vars()/to_numeric errors) ----------
         st.markdown("### 🗺️ Map View")
 
         def safe_map_df(df, role="rides"):
@@ -640,6 +640,14 @@ with tab_dispatch:
         rides_map_df = safe_map_df(r_mapped, "rides")
         drivers_map_df = safe_map_df(d_mapped, "drivers")
 
+        # ---- Theme-aware colors (so dots are visible on dark & light maps) ----
+        theme_base = (st.get_option("theme.base") or "").lower()
+        is_dark = theme_base == "dark"
+
+        DOT = [255, 255, 255] if is_dark else [0, 0, 0]          # ride dots: white on dark, black on light
+        DRIVER_DOT = [0, 200, 255] if is_dark else [0, 90, 160]   # driver dots: cyan-ish / blue-ish
+        LINE = [200, 200, 200] if is_dark else [60, 60, 60]       # assignment lines: light gray / dark gray
+
         layers = []
         if not rides_map_df.empty:
             layers.append(pdk.Layer(
@@ -647,6 +655,8 @@ with tab_dispatch:
                 data=rides_map_df.to_dict("records"),
                 get_position='[lng, lat]',
                 get_radius=50,
+                get_fill_color=DOT,
+                get_line_color=DOT,
                 pickable=True,
             ))
         if not drivers_map_df.empty:
@@ -655,6 +665,8 @@ with tab_dispatch:
                 data=drivers_map_df.to_dict("records"),
                 get_position='[lng, lat]',
                 get_radius=60,
+                get_fill_color=DRIVER_DOT,
+                get_line_color=DRIVER_DOT,
                 pickable=True,
             ))
 
@@ -702,10 +714,11 @@ with tab_dispatch:
                             data=line_records,
                             get_source_position='[from_lng, from_lat]',
                             get_target_position='[to_lng, to_lat]',
+                            get_color=LINE,
                             pickable=True,
                             width_min_pixels=2,
                         ))
-
+        
         # Initial view
         if not rides_map_df.empty:
             center_lat = rides_map_df["lat"].mean()
