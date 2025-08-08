@@ -1,0 +1,49 @@
+import streamlit as st
+import pandas as pd
+import datetime
+from openai import OpenAI
+import os
+
+# Set your OpenAI API key (you can get one from https://platform.openai.com/account/api-keys)
+openai_api_key = os.getenv("OPENAI_API_KEY")
+
+st.set_page_config(page_title="LOOP AI Chat", layout="wide")
+st.title("🧠 LOOP AI Chatbot")
+
+uploaded_file = st.file_uploader("📁 Upload your ride demand CSV", type=["csv"])
+
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+
+    # Basic cleaning
+    st.success("✅ File uploaded and processed!")
+    st.dataframe(df.head())
+
+    # Prompt formatting for AI
+    def ask_ai(question):
+        context = f"""You are LOOP's AI Assistant. Here is the CSV data:\n{df.head(100).to_string(index=False)}\n\nAnswer the following based on the data and common sense:"""
+        full_prompt = context + f"\n\nQuestion: {question}\nAnswer:"
+
+        try:
+            response = OpenAI(api_key=openai_api_key).chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an intelligent assistant that analyzes ride demand CSVs."},
+                    {"role": "user", "content": full_prompt}
+                ]
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"Error: {str(e)}"
+
+    # Chat UI
+    st.subheader("💬 Ask the AI about ride demand")
+    user_input = st.text_input("Type your question here (e.g. 'Which zones are busy at 6PM?')")
+
+    if user_input:
+        if openai_api_key:
+            with st.spinner("Thinking..."):
+                response = ask_ai(user_input)
+            st.markdown(f"**AI Response:** {response}")
+        else:
+            st.warning("⚠️ Please set your OpenAI API key in your environment variables.")

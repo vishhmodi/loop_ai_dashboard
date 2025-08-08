@@ -1,0 +1,30 @@
+import pandas as pd
+import random
+import datetime
+
+# Define geosquares around Ahmedabad
+latitudes = [23.02, 22.99, 22.98, 23.01, 23.03]
+longitudes = [72.55, 72.56, 72.57, 72.58, 72.59]
+
+start_date = datetime.datetime(2025, 8, 6)
+end_date = datetime.datetime(2025, 8, 21)
+time_interval = datetime.timedelta(minutes=15)
+
+rows = []
+current = start_date
+
+while current <= end_date:
+    for lat in latitudes:
+        for lon in longitudes:
+            demand = random.randint(0, 100)
+            rows.append({
+                "timestamp": current.strftime('%Y-%m-%d %H:%M:%S'),
+                "latitude": lat + round(random.uniform(-0.005, 0.005), 4),
+                "longitude": lon + round(random.uniform(-0.005, 0.005), 4),
+                "rides": demand
+            })
+    current += time_interval
+
+df = pd.DataFrame(rows)
+df.to_csv("loop_ahmedabad_aug6to21.csv", index=False)
+print("✅ CSV file generated as 'loop_ahmedabad_aug6to21.csv'")

@@ -1,0 +1,12 @@
+[theme]
+primaryColor = "#00FF6A"         # Loop green
+backgroundColor = "#000000"      # Pure black
+secondaryBackgroundColor = "#101010"  # Slightly lighter black for panels
+textColor = "#FFFFFF"            # White text
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+port = 8501

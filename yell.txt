@@ -1,0 +1,22 @@
+import csv
+import random
+import datetime
+
+filename = 'ahmedabad_demand.csv'
+
+with open(filename, mode='w', newline='') as file:
+    writer = csv.writer(file)
+    writer.writerow(['latitude', 'longitude', 'time'])  # ✅ Column names must match
+
+    start_time = datetime.datetime(2025, 8, 6, 0, 0)
+    end_time = datetime.datetime(2025, 8, 21, 23, 45)
+    delta = datetime.timedelta(minutes=15)
+
+    while start_time <= end_time:
+        for _ in range(random.randint(0, 5)):
+            lat = round(random.uniform(22.95, 23.10), 5)
+            lon = round(random.uniform(72.50, 72.70), 5)
+            writer.writerow([lat, lon, start_time])
+        start_time += delta
+
+print(f"CSV file '{filename}' created successfully.")
