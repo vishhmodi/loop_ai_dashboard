@@ -6,41 +6,29 @@ import io
 import math
 import json
 import datetime as dt
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
 import pydeck as pdk
-from pathlib import Path
-
-# Optional .env (local dev convenience)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
-# -----------------------------
-# OpenAI Client (new SDK)
-# -----------------------------
 from openai import OpenAI
 
-def get_api_key():
-    return (
-        st.secrets.get("OPENAI_API_KEY")
-        or os.getenv("OPENAI_API_KEY")
-    )
-
-API_KEY = get_api_key()
-if not API_KEY:
-    st.error("⚠️ OPENAI_API_KEY missing. Add it to .streamlit/secrets.toml or your environment/.env.")
+# -----------------------------
+# OpenAI Client (v1 SDK) — prefer Streamlit Secrets, fallback to env var
+# -----------------------------
+api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
+if not api_key:
+    st.error("⚠️ OPENAI_API_KEY missing. Add it to Streamlit Secrets or set it as an environment variable.")
     st.stop()
 
-client = OpenAI(api_key=API_KEY)
+client = OpenAI(api_key=api_key)
 MODEL = os.getenv("PULSE_MODEL", "gpt-4o-mini")
 
 # -----------------------------
 # Persistence paths (for quick-win: persistent memory)
 # -----------------------------
-DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 MEMORY_PATH = DATA_DIR / "pulse_memory.json"
 
 def load_json(path, default):
@@ -247,8 +235,7 @@ def map_columns(rides_df, drivers_df):
         if k not in d_mapped.columns and k in d_auto.columns:
             d_mapped[k] = d_auto[k]
 
-    # Final geo sanity & auto-swap
-        # 🔧 Final geo sanity & auto-swap
+    # 🔧 Final geo sanity & auto-swap
     r_mapped = detect_geo_for_rides(r_mapped)
     d_mapped = detect_geo_for_drivers(d_mapped)
 
@@ -392,7 +379,7 @@ Uploaded Reference Data (high priority if relevant):
 {data_block}
 
 Rules:
-- If greeted, reply like: "Hey Vish, I’m {PULSE_NAME} — I’m good! How are you?" then help with the task.
+- If greeted, reply like: "Hey Vish, I’m {PULSE_NAME}! How are you doing today?" then help with the task.
 - If user says "remember: <note>" or "/remember <note>", acknowledge and store the note.
 - When notes conflict, prefer the latest and confirm before discarding old policy.
 - Keep responses concise and practical; ask clarifying questions when needed.
@@ -767,7 +754,7 @@ with tab_chat:
     # Seed a friendly first message (visual)
     if not st.session_state.messages:
         with st.chat_message("assistant"):
-            st.markdown(f"Hey {USER_NICK}, I’m {PULSE_NAME} — I’m good! How are you? 🙂")
+            st.markdown(f"Hey {USER_NICK}, I’m {PULSE_NAME}! How are you doing today? 🙂")
 
     # Render history
     for m in st.session_state.messages:
