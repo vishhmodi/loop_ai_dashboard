@@ -380,11 +380,13 @@ def extract_avoid_keywords(notes: List[Dict[str, Any]]) -> List[str]:
                 avoids.append(token)
     return avoids
 
-def recommend_spot_for_driver(driver_id: str, radius_km: float = 3.0) -> Dict[str, Any]:
+def recommend_spot_for_driver(driver_id: str, radius_km: float = 3.0, time_window_hours: float = 2.0) -> Dict[str, Any]:
     """
-    Heuristic: find the densest nearby ride pickup area for the given driver.
-    - If geo available: compute nearest ride within radius and centroid of top-N close rides.
-    - Respect memory 'avoid <keyword>' by skipping zones/areas/spots that mention those tokens.
+    Recommend a wait spot for a driver using:
+      - Geo density of RECENT rides (within radius_km AND last time_window_hours)
+      - Memory 'avoid' rules
+    Returns a dict with lat/lng, sample count, and a human explainer.
+    Also stores an evidence dataframe in session for UI display.
     """
     r_mapped, d_mapped, _ = map_columns(st.session_state.rides_df, st.session_state.drivers_df)
     if r_mapped is None or d_mapped is None:
@@ -398,75 +400,129 @@ def recommend_spot_for_driver(driver_id: str, radius_km: float = 3.0) -> Dict[st
         return {"ok": False, "reason": f"Driver {driver_id} not found."}
 
     drv = rowd.iloc[0]
+    # ZONE fallback if no geo for driver
     if pd.isna(pd.to_numeric(drv.get("lat"), errors="coerce")) or pd.isna(pd.to_numeric(drv.get("lng"), errors="coerce")):
-        # fall back to zone match
         for key in ["spot_id","zone","area"]:
             if key in d_mapped.columns and key in r_mapped.columns and pd.notna(drv.get(key,"")):
                 cand = r_mapped[r_mapped[key].astype(str) == str(drv.get(key))]
                 if not cand.empty:
+                    st.session_state["last_tool_evidence"] = {
+                        "source": "recommend_wait_spot",
+                        "radius_km": float(radius_km),
+                        "time_window_hours": float(time_window_hours),
+                        "ts": pd.Timestamp.utcnow().isoformat(),
+                        "df": cand.head(50).copy()
+}
+  # store some rows
                     return {
                         "ok": True,
                         "mode": "zone",
                         "zone_key": key,
                         "zone_value": str(drv.get(key)),
-                        "reason": f"Same {key} as driver."
+                        "samples": int(len(cand)),
+                        "reason": f"Same {key} as driver; {len(cand)} matching rides (no geo for driver)."
                     }
         return {"ok": False, "reason": "No geo for driver; no overlapping zone to recommend."}
 
-    # Geo mode
-    r_geo = detect_geo_for_rides(r_mapped)
+    # ---- GEO mode
+    r_geo = detect_geo_for_rides(r_mapped).copy()
     r_geo["pickup_lat"] = pd.to_numeric(r_geo.get("pickup_lat"), errors="coerce")
     r_geo["pickup_lng"] = pd.to_numeric(r_geo.get("pickup_lng"), errors="coerce")
     r_geo = r_geo.dropna(subset=["pickup_lat","pickup_lng"])
     if r_geo.empty:
         return {"ok": False, "reason": "No usable ride coordinates to analyze."}
 
+    # Try to parse a time column for "recent" filter
+    now = pd.Timestamp.utcnow()
+    time_col = None
+    for cand in ["pickup_time","requested_at","time","timestamp","created_at"]:
+        if cand in r_geo.columns:
+            time_col = cand
+            break
+    if time_col:
+        # tolerant datetime parsing
+        r_geo["_pickup_dt"] = pd.to_datetime(r_geo[time_col], errors="coerce", utc=True)
+        cutoff = now - pd.Timedelta(hours=float(time_window_hours))
+        r_geo_recent = r_geo[r_geo["_pickup_dt"].notna() & (r_geo["_pickup_dt"] >= cutoff)].copy()
+        if r_geo_recent.empty:
+            # If nothing recent, fall back to all-time but tell the user
+            r_geo_recent = r_geo.copy()
+            used_recent = False
+        else:
+            used_recent = True
+    else:
+        r_geo_recent = r_geo.copy()
+        used_recent = False  # no time column available
+
     dlat = float(pd.to_numeric(drv["lat"], errors="coerce"))
     dlng = float(pd.to_numeric(drv["lng"], errors="coerce"))
 
-    # Respect memory avoids
     avoids = extract_avoid_keywords(st.session_state.pulse_memory)
     def is_avoided(row) -> bool:
-        hay = " ".join([str(row.get(k,"")) for k in ["spot_id","zone","area"] if k in r_geo.columns]).lower()
+        hay = " ".join([str(row.get(k,"")) for k in ["spot_id","zone","area"] if k in r_geo_recent.columns]).lower()
         return any(a in hay for a in avoids)
 
-    r_geo["__dist"] = r_geo.apply(lambda row: haversine(dlat, dlng, row["pickup_lat"], row["pickup_lng"]), axis=1)
-    nearby = r_geo[(r_geo["__dist"].notna()) & (r_geo["__dist"] <= float(radius_km))].copy()
-    if not nearby.empty:
-        # drop avoided
-        if avoids:
-            nearby = nearby[~nearby.apply(is_avoided, axis=1)]
-        if not nearby.empty:
-            # centroid of top 30 nearest
-            nearby_sorted = nearby.sort_values("__dist").head(30)
-            rec_lat = nearby_sorted["pickup_lat"].mean()
-            rec_lng = nearby_sorted["pickup_lng"].mean()
-            top_reason = f"{len(nearby_sorted)} recent pickups within {radius_km:.1f} km"
-            if avoids:
-                top_reason += f"; avoided: {', '.join(avoids)}"
-            return {
-                "ok": True,
-                "mode": "geo",
-                "lat": float(rec_lat),
-                "lng": float(rec_lng),
-                "samples": int(len(nearby_sorted)),
-                "reason": top_reason
-            }
+    # Compute distances and filter by radius
+    r_geo_recent["__dist"] = r_geo_recent.apply(lambda row: haversine(dlat, dlng, row["pickup_lat"], row["pickup_lng"]), axis=1)
+    nearby = r_geo_recent[(r_geo_recent["__dist"].notna()) & (r_geo_recent["__dist"] <= float(radius_km))].copy()
 
-    # If nothing nearby within radius, just pick closest ride centroid overall (still respect avoids)
-    pool = r_geo.copy()
-    if avoids:
+    # Apply avoids
+    if avoids and not nearby.empty:
+        nearby = nearby[~nearby.apply(is_avoided, axis=1)]
+
+    # If we have nearby recent rides, pick centroid of up to 30 nearest
+    if not nearby.empty:
+        nearby_sorted = nearby.sort_values("__dist").head(30)
+        rec_lat = nearby_sorted["pickup_lat"].mean()
+        rec_lng = nearby_sorted["pickup_lng"].mean()
+        sample_count = int(len(nearby_sorted))
+        # store evidence in session so UI can show it
+        cols_show = [c for c in ["ride_id", time_col, "pickup_lat", "pickup_lng", "zone", "area", "spot_id", "__dist"] if c in nearby_sorted.columns]
+        st.session_state["last_tool_evidence"] = {
+            "source": "recommend_wait_spot",
+            "radius_km": float(radius_km),
+            "time_window_hours": float(time_window_hours),
+            "ts": pd.Timestamp.utcnow().isoformat(),
+            "df": nearby_sorted[cols_show].copy()
+}
+
+        reason = f"{sample_count} recent pickups within {radius_km:.1f} km"
+        if used_recent:
+            reason += f" in the last {time_window_hours:g}h"
+        else:
+            if time_col:
+                reason += f" (no rides in last {time_window_hours:g}h; using all available)"
+            else:
+                reason += " (no pickup time column found; using all available)"
+        if avoids:
+            reason += f"; avoided: {', '.join(avoids)}"
+        return {"ok": True, "mode": "geo", "lat": float(rec_lat), "lng": float(rec_lng), "samples": sample_count, "reason": reason}
+
+    # Otherwise use a broader centroid on the closest 50 rides
+    pool = r_geo_recent.copy()
+    if avoids and not pool.empty:
         pool = pool[~pool.apply(is_avoided, axis=1)]
     if pool.empty:
-        return {"ok": False, "reason": "All candidate spots are blocked by avoid rules."}
+        return {"ok": False, "reason": "All candidate spots are blocked by avoid rules or no data in range."}
     pool = pool.sort_values("__dist").head(50)
+    cols_show = [c for c in ["ride_id", time_col, "pickup_lat", "pickup_lng", "zone", "area", "spot_id", "__dist"] if c in pool.columns]
+    st.session_state["last_tool_evidence"] = {
+        "source": "recommend_wait_spot",
+        "radius_km": float(radius_km),
+        "time_window_hours": float(time_window_hours),
+        "ts": pd.Timestamp.utcnow().isoformat(),
+        "df": pool[cols_show].copy()
+}
+
     return {
         "ok": True,
         "mode": "geo-fallback",
         "lat": float(pool["pickup_lat"].mean()),
         "lng": float(pool["pickup_lng"].mean()),
         "samples": int(len(pool)),
-        "reason": f"No nearby rides within {radius_km:.1f} km; suggested centroid of {len(pool)} closest pickups."
+        "reason": f"No rides within {radius_km:.1f} km; suggested centroid of {len(pool)} closest pickups"
+                 + (f" in the last {time_window_hours:g}h" if time_col else " (no pickup time column found)")
+                 + (f"; avoided: {', '.join(avoids)}" if avoids else "")
     }
 
 # -----------------------------
@@ -568,7 +624,8 @@ TOOLS = [
             "properties": {
                 "driver_id": {"type": "string"},
                 "driver_name": {"type": "string"},
-                "radius_km": {"type": "number", "default": 3.0}
+                "radius_km": {"type": "number", "default": 3.0},
+                "time_window_hours": {"type": "number", "default": 2.0}
             },
             "required": []
         }
@@ -635,14 +692,99 @@ def tool_assign_nearest_for_ride(ride_id: str, max_km: Optional[float]) -> Dict[
         "distance_km": float(best[1])
     }
 
-def tool_recommend_wait_spot(driver_id: Optional[str], driver_name: Optional[str], radius_km: Optional[float]) -> Dict[str, Any]:
+def tool_recommend_wait_spot(
+    driver_id: Optional[str],
+    driver_name: Optional[str],
+    radius_km: Optional[float],
+    time_window_hours: Optional[float]
+) -> Dict[str, Any]:
     """
     Name/ID resolver for recommending a wait spot.
     Investor-friendly behavior:
       - Accepts driver_id OR driver_name
-      - Matching order: Exact (case-insensitive) → Prefix → Space-insensitive contains → Fuzzy (SequenceMatcher)
+      - Matching order: Exact → Prefix → Space-insensitive contains → Fuzzy (SequenceMatcher)
       - If multiple likely matches, return a short disambiguation list
     """
+
+    # ---- helpers
+    def norm(s: str) -> str:
+        return str(s or "").strip().lower()
+
+    def nospace(s: str) -> str:
+        return norm(s).replace(" ", "")
+
+    def token_sort(s: str) -> str:
+        toks = [t for t in norm(s).split() if t]
+        return " ".join(sorted(toks))
+
+    def fuzzy_ratio(a: str, b: str) -> float:
+        return SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+    if (not driver_id) and driver_name:
+        try:
+            # Standardize driver data
+            _, d_mapped, _ = map_columns(st.session_state.rides_df, st.session_state.drivers_df)
+            if d_mapped is None or d_mapped.empty or "name" not in d_mapped.columns or "driver_id" not in d_mapped.columns:
+                return {"ok": False, "reason": "Drivers data not loaded or missing name/driver_id columns."}
+
+            needle = str(driver_name)
+            needle_n = norm(needle)
+            needle_ns = nospace(needle)
+            needle_ts = token_sort(needle)
+
+            rows = []
+            for _, row in d_mapped.iterrows():
+                name = str(row.get("name", ""))
+                did  = str(row.get("driver_id", ""))
+                name_n  = norm(name)
+                name_ns = nospace(name)
+                name_ts = token_sort(name)
+
+                if name_n == needle_n or name_ts == needle_ts:
+                    score = 1.0
+                elif name_n.startswith(needle_n) or name_ts.startswith(needle_ts):
+                    score = 0.92
+                elif needle_ns and (needle_ns in name_ns):
+                    score = 0.86
+                else:
+                    score = fuzzy_ratio(needle, name)
+
+                rows.append({"driver_id": did, "name": name, "score": float(score)})
+
+            if not rows:
+                return {"ok": False, "reason": f"No drivers loaded to match against '{driver_name}'."}
+
+            rows.sort(key=lambda r: r["score"], reverse=True)
+
+            BEST_ACCEPT = 0.75
+            AMBIGUOUS_BAND = 0.72
+
+            top = rows[0]
+            if top["score"] >= BEST_ACCEPT:
+                second = rows[1] if len(rows) > 1 else None
+                if second and (top["score"] - second["score"] < 0.03):
+                    choices = [{"driver_id": r["driver_id"], "name": r["name"], "score": round(r["score"], 2)} for r in rows[:6]]
+                    return {"ok": False, "reason": f"Multiple close matches for '{driver_name}'. Please specify ID.", "choices": choices}
+                driver_id = top["driver_id"]
+            else:
+                near = [r for r in rows if r["score"] >= AMBIGUOUS_BAND]
+                if len(near) == 1:
+                    driver_id = near[0]["driver_id"]
+                elif len(near) > 1:
+                    choices = [{"driver_id": r["driver_id"], "name": r["name"], "score": round(r["score"], 2)} for r in near[:6]]
+                    return {"ok": False, "reason": f"Multiple drivers match '{driver_name}'. Please specify ID.", "choices": choices}
+                else:
+                    return {"ok": False, "reason": f"No driver found close to '{driver_name}'. Try a fuller name or the ID."}
+
+        except Exception as e:
+            return {"ok": False, "reason": f"Name resolution error: {e}"}
+
+    if not driver_id:
+        return {"ok": False, "reason": "Please provide a driver_id or a driver_name."}
+
+    # Final: call the core spot recommendation (pass time_window_hours through)
+    return recommend_spot_for_driver(driver_id, radius_km or 3.0, time_window_hours or 2.0)
+
 
     # ---- helpers
     def norm(s: str) -> str:
@@ -805,7 +947,7 @@ TOOL_IMPL = {
     "get_assignment_mode": lambda **_: tool_get_assignment_mode(),
     "auto_assign_all": lambda max_km=None, **_: tool_auto_assign_all(max_km),
     "assign_nearest_for_ride": lambda ride_id, max_km=None, **_: tool_assign_nearest_for_ride(ride_id, max_km),
-    "recommend_wait_spot": lambda driver_id=None, driver_name=None, radius_km=3.0, **_: tool_recommend_wait_spot(driver_id, driver_name, radius_km),
+    "recommend_wait_spot": lambda driver_id=None, driver_name=None, radius_km=3.0, time_window_hours=2.0, **_: tool_recommend_wait_spot(driver_id, driver_name, radius_km, time_window_hours),
 
 }
 
@@ -1241,7 +1383,23 @@ with tab_chat:
                     st.error(f"OpenAI error: {e}")
                     reply = "Hit a snag calling the model. Check your API key/usage and try again."
                 st.markdown(reply)
-                st.session_state.messages.append({"role":"assistant","content": reply})
+                 # 🔎 Evidence viewer (only for recommend_wait_spot), then clear it
+evi = st.session_state.get("last_tool_evidence")
+if isinstance(evi, dict) and evi.get("source") == "recommend_wait_spot":
+    df = evi.get("df")
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        radius = evi.get("radius_km")
+        window = evi.get("time_window_hours")
+        with st.expander("🔎 Evidence: recent pickups used for this recommendation", expanded=False):
+            if radius is not None and window is not None:
+                st.caption(f"Rows: {len(df)} • Radius: {radius} km • Window: {window}h")
+            else:
+                st.caption(f"Rows: {len(df)}")
+            st.dataframe(df, use_container_width=True)
+    # Clear so it doesn't show on unrelated replies
+    st.session_state["last_tool_evidence"] = None
+
+    st.session_state.messages.append({"role":"assistant","content": reply})
 
 # ======== DATA ========
 with tab_data:
